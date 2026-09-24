@@ -14,12 +14,13 @@
       [3] THIS PC / RECYCLE BIN - one column, vertically centred, with one empty
                          column before the application block.
       [4] APPLICATIONS - shortcuts, hard against the right edge.  Icons are
-                         ordered by colour family top-to-bottom in rainbow order:
+                         ordered by colour family top-to-bottom:
                              WHITE -> RED -> ORANGE -> YELLOW -> GREEN -> CYAN
-                             -> BLUE -> PURPLE -> BLACK
+                             -> BLUE -> PURPLE -> MIXED -> BLACK
                          and filled left-to-right, row by row, in as few columns
                          as the screen height allows (rows may mix families).
-                         Any icon darker than $blackLight is filed as black.
+                         MIXED ("杂色") collects icons whose colour cannot be
+                         pinned down - see the classifier below.
 
     Usage
       preview only :  powershell -ExecutionPolicy Bypass -File Arrange-Desktop.ps1
@@ -64,13 +65,18 @@ try { $shell = New-Object -ComObject WScript.Shell } catch { $shell = $null }
 # ------------------------------------------------------------------- settings
 $folderCols   = 2          # width of the folder block in columns
 $fileRowMax   = 5          # a single file type never spreads wider than this
-$neutralCut   = 0.15       # below this colourfulness an icon counts as grey
-$whiteLight   = 0.80       # a coloured icon this light is filed as white
-$paleLight    = 0.50       # grey icons at least this light are white, else black
-$blackLight   = 0.40       # any icon this dark is filed as black, whatever its hue
 
-# rainbow order, white on top and black at the bottom
-$familyOrder = @('WHITE', 'RED', 'ORANGE', 'YELLOW', 'GREEN', 'CYAN', 'BLUE', 'PURPLE', 'BLACK')
+# --- colour classifier thresholds (area voting + median colour) -------------
+$whiteAreaCut = 0.50       # this much near-white area          -> WHITE
+$whiteMedCut  = 0.85       # median lightness at least this high -> WHITE
+$blackAreaCut = 0.50       # this much near-black area          -> BLACK
+$dominantCut  = 0.40       # one hue family owning this much area wins outright
+$darkMedCut   = 0.20       # cool dominant family + median this dark -> BLACK
+$nearGraySat  = 0.12       # median saturation below this counts as grey
+$darkGrayCut  = 0.25       # grey median this dark -> BLACK, anything else -> MIXED
+
+# rainbow order, white on top and black at the bottom; MIXED (杂色) sits before black
+$familyOrder = @('WHITE', 'RED', 'ORANGE', 'YELLOW', 'GREEN', 'CYAN', 'BLUE', 'PURPLE', 'MIXED', 'BLACK')
 
 # ------------------------------------------------- personal overrides (optional)
 # "分类覆盖.txt" - one rule per line, "icon name = VALUE", # starts a comment.
@@ -97,14 +103,10 @@ if (Test-Path -LiteralPath $overrideFile) {
 $desk  = [Environment]::GetFolderPath('Desktop')
 $pub   = [Environment]::GetFolderPath('CommonDesktopDirectory')
 
-# Shell namespace items are addressed by CLSID; their icons cannot be read back
-# through SHGetFileInfo, so their measured colours are pinned here.
+# Shell namespace items are addressed by CLSID so the shell resolves their icon.
 $special = @{}
 $special[[string]([char]0x6B64 + [char]0x7535 + [char]0x8111)] = '::{20D04FE0-3AEA-1069-A2D8-08002B30309D}'  # This PC
 $special[[string]([char]0x56DE + [char]0x6536 + [char]0x7AD9)] = '::{645FF040-5081-101B-9F08-00AA002F954E}'  # Recycle Bin
-$pinned = @{}
-$pinned[[string]([char]0x6B64 + [char]0x7535 + [char]0x8111)] = @{ Hue = 208.0; CF = 0.55; Light = 0.58 }
-$pinned[[string]([char]0x56DE + [char]0x6536 + [char]0x7AD9)] = @{ Hue = $null; CF = 0.05; Light = 0.80 }
 
 function Resolve-IconPath([string]$name) {
     if ($special.ContainsKey($name)) { return $special[$name] }
@@ -150,13 +152,7 @@ function Sort-Natural([string[]]$names) {
     return $a
 }
 
-function Get-AppFamily([object]$hue, [double]$cf, [double]$light) {
-    if ($light -lt $blackLight) { return 'BLACK' }      # dark icons read as black
-    if ($cf -lt $neutralCut -or $null -eq $hue) {
-        if ($light -ge $paleLight) { return 'WHITE' } else { return 'BLACK' }
-    }
-    if ($light -ge $whiteLight) { return 'WHITE' }
-    $h = [double]$hue
+function Get-HueFamily([double]$h) {
     if ($h -ge 330 -or $h -lt 15) { return 'RED' }
     if ($h -lt 45)  { return 'ORANGE' }
     if ($h -lt 70)  { return 'YELLOW' }
@@ -164,6 +160,33 @@ function Get-AppFamily([object]$hue, [double]$cf, [double]$light) {
     if ($h -lt 200) { return 'CYAN' }
     if ($h -lt 255) { return 'BLUE' }
     return 'PURPLE'
+}
+
+# v2 classifier: vote by AREA, then fall back to the MEDIAN colour.
+#  1) mostly white, or a very light median      -> WHITE
+#  2) mostly black                              -> BLACK
+#  3) one hue family owns >= 40% of the area:
+#       warm (red/orange/yellow)                 -> that family (a warm accent reads
+#                                                   through a dark background)
+#       cool but the median colour is very dark  -> BLACK (dark navy reads as black)
+#       otherwise                                -> that family
+#  4) no family dominates -> decide by the median colour's hue
+#  5) median is near-grey at mid lightness      -> MIXED (the "unsorted" band)
+function Get-AppFamily([object]$ci) {
+    if (-not $ci.Found) { return 'MIXED' }
+    if ($ci.WhiteFrac -ge $whiteAreaCut -or $ci.MedLight -ge $whiteMedCut) { return 'WHITE' }
+    if ($ci.BlackFrac -ge $blackAreaCut) { return 'BLACK' }
+    $names = @('RED', 'ORANGE', 'YELLOW', 'GREEN', 'CYAN', 'BLUE', 'PURPLE')
+    if ($ci.TopFamFrac -ge $dominantCut) {
+        if ($ci.TopFam -le 2) { return $names[$ci.TopFam] }
+        if ($ci.MedLight -le $darkMedCut) { return 'BLACK' }
+        return $names[$ci.TopFam]
+    }
+    if ($ci.MedSat -lt $nearGraySat) {
+        if ($ci.MedLight -le $darkGrayCut) { return 'BLACK' }
+        return 'MIXED'
+    }
+    return (Get-HueFamily $ci.MedHue)
 }
 
 # ---------------------------------------------------------------- read desktop
@@ -261,23 +284,22 @@ foreach ($n in $overrideNotes) { "  override $n" }
 
 # ------------------------------------------------------------ colour of apps
 $appInfo = foreach ($n in $appNames) {
-    if ($pinned.ContainsKey($n)) {
-        $h = $pinned[$n].Hue; $cf = [double]$pinned[$n].CF; $lt = [double]$pinned[$n].Light
-    }
-    else {
-        $ci = [IconColorAnalyzer]::Analyze((Resolve-IconPath $n))
-        $h  = if ($ci.Found -and $ci.Hue -ge 0) { [double]$ci.Hue } else { $null }
-        $cf = if ($ci.Found) { [double]$ci.Colorfulness } else { 0.0 }
-        $lt = if ($ci.Found) { [double]$ci.Lightness } else { 0.5 }
-    }
-    $fam = Get-AppFamily $h $cf $lt
+    $ci = [IconColorAnalyzer]::Analyze((Resolve-IconPath $n))
+    $fam = Get-AppFamily $ci
     if ($familyOverride.ContainsKey($n)) { $fam = $familyOverride[$n] }
+    $keyHue = if ($ci.Found -and $ci.MedHue -ge 0) { [double]$ci.MedHue } else { 0.0 }
+    if ($fam -eq 'RED' -and $keyHue -ge 330) { $keyHue -= 360 }
     [pscustomobject]@{
-        Name  = $n
-        Family = $fam
-        HueKey   = if ($null -ne $h -and $h -ge 330 -and $fam -eq 'RED') { [double]$h - 360 }
-                   else { if ($null -eq $h) { 0.0 } else { [double]$h } }
-        LightKey = -1 * $lt
+        Name     = $n
+        Family   = $fam
+        HueKey   = $keyHue
+        LightKey = -1 * $(if ($ci.Found) { $ci.MedLight } else { 0.5 })
+        MedR     = $(if ($ci.Found) { $ci.MedR } else { 0 })
+        MedG     = $(if ($ci.Found) { $ci.MedG } else { 0 })
+        MedB     = $(if ($ci.Found) { $ci.MedB } else { 0 })
+        TopFam   = $(if ($ci.Found) { $ci.TopFamFrac } else { 0 })
+        White    = $(if ($ci.Found) { $ci.WhiteFrac } else { 0 })
+        Black    = $(if ($ci.Found) { $ci.BlackFrac } else { 0 })
     }
 }
 

@@ -33,7 +33,7 @@
       汽水音乐 = GREEN
       微信 = WHITE
       Projects = APP
-  等号右边可以是颜色系（WHITE/RED/ORANGE/YELLOW/GREEN/CYAN/BLUE/PURPLE/BLACK），
+  等号右边可以是颜色系（WHITE/RED/ORANGE/YELLOW/GREEN/CYAN/BLUE/PURPLE/MIXED/BLACK），
   也可以是区域（FILE/FOLDER/APP/SPECIAL）。保存后下次排列生效，不用改脚本。
 
 【排布规则】
@@ -41,7 +41,7 @@
   区域二 文件夹：  紧挨文件区右边、中间空 1 列；上下居中
   区域三 此电脑/回收站：单独占一竖列，上下居中；与应用区之间空 1 列
   区域四 应用软件： 贴屏幕最右侧，按颜色自上而下：
-                    白 → 红 → 橙 → 黄 → 绿 → 青 → 蓝 → 紫 → 黑
+                    白 → 红 → 橙 → 黄 → 绿 → 青 → 蓝 → 紫 → 杂色 → 黑
                     逐行从左往右填，列数自动取"最少够用"
   所有区域都上下居中或靠下，不贴屏幕顶部。
 
