@@ -1,0 +1,13 @@
+# Windows 原生项目：脚本与文本在工作区使用 CRLF。
+# .cmd 尤其必须 —— batch 文件的 goto :label 在纯 LF 行尾下会失效。
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+*.cs  text eol=crlf
+*.txt text eol=crlf
+
+# 下面这些保持 LF（跨平台脚本 / GitHub 展示）
+.gitattributes text eol=lf
+.gitignore     text eol=lf
+.githooks/*    text eol=lf
+LICENSE        text eol=lf
+*.md           text eol=lf

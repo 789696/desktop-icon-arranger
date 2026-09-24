@@ -1,0 +1,23 @@
+#!/bin/sh
+# ============================================================
+#  pre-commit 守卫：阻止把本机的桌面布局快照提交上去
+#
+#  snapshots/ 里存的是这台电脑的桌面图标清单（会暴露你装了哪些软件、
+#  有哪些私人文件）以及电脑名。它已经被 .gitignore 挡住，
+#  这个钩子再加一道保险，防止有人用 "git add -f" 强行加进来。
+#
+#  启用方式（在仓库根目录执行一次）：
+#      git config core.hooksPath .githooks
+# ============================================================
+
+if git diff --cached --name-only --diff-filter=ACM | grep -q '^snapshots/'; then
+    echo ""
+    echo "!! 提交被拒绝：snapshots/ 里是【本机私有的】桌面布局快照。"
+    echo "!! 它包含你的桌面图标清单和电脑名，不应该出现在开源仓库里。"
+    echo "!!"
+    echo "!! Refusing to commit: snapshots/ holds machine-private layout data."
+    echo ""
+    exit 1
+fi
+
+exit 0
