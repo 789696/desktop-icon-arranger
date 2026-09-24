@@ -8,6 +8,10 @@
 > and applications as a colour band. Double-click to run: no installer, no admin rights,
 > no network access, no dependencies beyond what ships with Windows.
 
+![演示](docs/demo.gif)
+
+*双击运行 → 打印排布方案 → 回车 → 图标按颜色飞入四个区域（GIF 为 1.5 倍速）*
+
 ---
 
 ## 特性
