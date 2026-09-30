@@ -39,7 +39,8 @@
 #>
 param(
     [switch]$Apply,
-    [switch]$Yes        # skip the "press Enter" confirmation when applying
+    [switch]$Yes,       # skip the "press Enter" confirmation when applying
+    [switch]$FilesOnly  # tidy the loose files and the folder block, leave apps alone
 )
 
 $ErrorActionPreference = 'Stop'
@@ -74,6 +75,14 @@ $dominantCut  = 0.40       # one hue family owning this much area wins outright
 $darkMedCut   = 0.20       # cool dominant family + median this dark -> BLACK
 $nearGraySat  = 0.12       # median saturation below this counts as grey
 $darkGrayCut  = 0.25       # grey median this dark -> BLACK, anything else -> MIXED
+$grayHueCut   = 0.20       # grey median but this much of one hue -> that hue, not MIXED
+
+# --- ordering inside a family ----------------------------------------------
+# vividness = $vividWeight * chroma + (1 - $vividWeight) * lightness
+#   chroma is max-min of the median colour, so a near-white icon cannot fake it.
+#   Icons are laid out most-vivid-first, so a family fades from bright/saturated
+#   at the top to dull/dark at the bottom - the same direction as white -> black.
+$vividWeight  = 0.55
 
 # rainbow order, white on top and black at the bottom; MIXED (杂色) sits before black
 $familyOrder = @('WHITE', 'RED', 'ORANGE', 'YELLOW', 'GREEN', 'CYAN', 'BLUE', 'PURPLE', 'MIXED', 'BLACK')
@@ -184,6 +193,10 @@ function Get-AppFamily([object]$ci) {
     }
     if ($ci.MedSat -lt $nearGraySat) {
         if ($ci.MedLight -le $darkGrayCut) { return 'BLACK' }
+        # A grey median does NOT automatically mean "unsorted": if one hue family still
+        # owns a meaningful share of the pixels, that hue is what the eye reads.
+        # MIXED is the last resort, for icons with no readable colour at all.
+        if ($ci.TopFamFrac -ge $grayHueCut) { return $names[$ci.TopFam] }
         return 'MIXED'
     }
     return (Get-HueFamily $ci.MedHue)
@@ -283,16 +296,30 @@ foreach ($n in $overrideNotes) { "  override $n" }
 ""
 
 # ------------------------------------------------------------ colour of apps
+# -FilesOnly skips all of this: no icon is measured and no application is touched.
+$appInfo = @()
+$appSorted = @()
+if (-not $FilesOnly) {
 $appInfo = foreach ($n in $appNames) {
     $ci = [IconColorAnalyzer]::Analyze((Resolve-IconPath $n))
     $fam = Get-AppFamily $ci
     if ($familyOverride.ContainsKey($n)) { $fam = $familyOverride[$n] }
     $keyHue = if ($ci.Found -and $ci.MedHue -ge 0) { [double]$ci.MedHue } else { 0.0 }
     if ($fam -eq 'RED' -and $keyHue -ge 330) { $keyHue -= 360 }
+    # vividness: how bright AND saturated the icon looks.  Chroma is max-min of the
+    # median colour, not HSL saturation - the latter explodes for near-white colours
+    # (a 248,250,252 white would score 0.4 "saturation").
+    $vivid = 0.0
+    if ($ci.Found) {
+        $mx = [math]::Max($ci.MedR, [math]::Max($ci.MedG, $ci.MedB)) / 255.0
+        $mn = [math]::Min($ci.MedR, [math]::Min($ci.MedG, $ci.MedB)) / 255.0
+        $vivid = $vividWeight * ($mx - $mn) + (1 - $vividWeight) * [double]$ci.MedLight
+    }
     [pscustomobject]@{
         Name     = $n
         Family   = $fam
         HueKey   = $keyHue
+        Vivid    = $vivid
         LightKey = -1 * $(if ($ci.Found) { $ci.MedLight } else { 0.5 })
         MedR     = $(if ($ci.Found) { $ci.MedR } else { 0 })
         MedG     = $(if ($ci.Found) { $ci.MedG } else { 0 })
@@ -303,15 +330,17 @@ $appInfo = foreach ($n in $appNames) {
     }
 }
 
-# colour order top-to-bottom; inside a family the hue runs as a gradient
+# Colour order top-to-bottom; inside a family the hue runs as a gradient so that
+# neighbouring families join up.  The brightness gradient is NOT applied here - it
+# is applied per row in the plan builder below.
 $appSorted = @()
 foreach ($f in $familyOrder) {
     $members = @($appInfo | Where-Object { $_.Family -eq $f })
     if ($members.Count -eq 0) { continue }
-    if ($f -eq 'WHITE' -or $f -eq 'BLACK') { $members = @($members | Sort-Object LightKey, Name) }
-    else                                   { $members = @($members | Sort-Object HueKey, Name) }
+    $members = @($members | Sort-Object @{ Expression = 'HueKey' }, @{ Expression = 'Name' })
     $appSorted += $members
 }
+}   # end of the block that -FilesOnly skips
 
 # ------------------------------------------------------------------ build plan
 $script:cw = $cw; $script:ch = $ch; $script:marginX = $marginX; $script:marginY = $marginY
@@ -331,13 +360,37 @@ for ($r = 0; $r -lt $fileRows.Count; $r++) {
 for ($i = 0; $i -lt $folderNames.Count; $i++) {
     Add-Plan $folderNames[$i] ($folderZoneCol + [int][math]::Floor($i / $folderRowsUsed)) ($folderTopRow + ($i % $folderRowsUsed)) 'FOLDER'
 }
-for ($i = 0; $i -lt $specialNames.Count; $i++) {
-    Add-Plan $specialNames[$i] $specialCol ($specialTopRow + $i) 'SPECIAL'
+# -FilesOnly leaves "This PC" / "Recycle Bin" exactly where they are.
+if (-not $FilesOnly) {
+    for ($i = 0; $i -lt $specialNames.Count; $i++) {
+        Add-Plan $specialNames[$i] $specialCol ($specialTopRow + $i) 'SPECIAL'
+    }
 }
-for ($i = 0; $i -lt $appSorted.Count; $i++) {
-    $r = $appTopRow + [int][math]::Floor($i / $appColWidth)
-    $inRow = [int][math]::Min($appColWidth, $appSorted.Count - ($r - $appTopRow) * $appColWidth)
-    Add-Plan $appSorted[$i].Name ($appZoneRight - $inRow + 1 + ($i % $appColWidth)) $r ('APP ' + $appSorted[$i].Family)
+# Applications fill the zone row by row, left to right, and then EVERY ROW is
+# re-sorted so that it reads bright/saturated -> dull/dark from left to right.
+# Two things fall out of that:
+#   * the eye gets a clean gradient along every row;
+#   * column k of two neighbouring rows sits at the same point of the gradient, so
+#     up/down neighbours match as well (a snake fill does the opposite - it puts the
+#     two ends of the gradient next to each other).
+# The sort keeps the FAMILY together first: a row that straddles a colour-family
+# boundary keeps the incoming family on the left and the outgoing one on the right,
+# so a stray icon never lands in the middle of another colour band.
+for ($r = 0; $r -lt $appRowCount; $r++) {
+    $rowItems = @()
+    for ($c = 0; $c -lt $appColWidth; $c++) {
+        $idx = $r * $appColWidth + $c
+        if ($idx -lt $appSorted.Count) { $rowItems += $appSorted[$idx] }
+    }
+    if ($rowItems.Count -eq 0) { continue }
+    $rowItems = @($rowItems | Sort-Object @{ Expression = { $familyOrder.IndexOf($_.Family) } },
+                                            @{ Expression = 'Vivid'; Descending = $true },
+                                            @{ Expression = 'HueKey' },
+                                            @{ Expression = 'Name' })
+    $firstCol = $appZoneRight - $rowItems.Count + 1
+    for ($k = 0; $k -lt $rowItems.Count; $k++) {
+        Add-Plan $rowItems[$k].Name ($firstCol + $k) ($appTopRow + $r) ('APP ' + $rowItems[$k].Family)
+    }
 }
 if ($appRowCount -gt 0 -and $appTopRow + $appRowCount - 1 -ge $rows) {
     throw "the app zone needs more rows than the screen has"
@@ -393,12 +446,26 @@ try {
 }
 
 $freeCols  = @(0..$maxCol | Where-Object { $planCols -notcontains $_ })
+if ($FilesOnly) {
+    # Park the files/folders in the empty middle of the desktop, never inside the
+    # application block - explorer would shove the app icons around.
+    $parkCols = @($freeCols | Where-Object { $_ -lt ($appZoneLeft - 1) })
+    if ($parkCols.Count) { $freeCols = $parkCols }
+}
 $stageCols = @($freeCols | Select-Object -First ([int][math]::Ceiling($plan.Count / $rows)))
 
 $view = New-Object DesktopView
 try {
     $count = $view.Count
-    if ($count -ne $plan.Count) { throw "desktop icon count changed ($count vs $($plan.Count)); aborting" }
+    if ($FilesOnly) {
+        # Only the files and folders are in the plan, so the count check does not
+        # apply - just make sure every planned icon is still on the desktop.
+        $present = @{}
+        for ($i = 0; $i -lt $count; $i++) { $present[$view.GetName($i)] = $true }
+        $gone = @($plan | Where-Object { -not $present.ContainsKey($_.Name) })
+        if ($gone.Count) { throw "$($gone.Count) planned icon(s) are no longer on the desktop; aborting" }
+    }
+    elseif ($count -ne $plan.Count) { throw "desktop icon count changed ($count vs $($plan.Count)); aborting" }
 
     function Get-IndexMap([object]$v, [int]$n) { $m = @{}; for ($i = 0; $i -lt $n; $i++) { $m[$v.GetName($i)] = $i }; return $m }
     function Get-OffTarget([object]$v, [object]$m, [object]$pl) {
