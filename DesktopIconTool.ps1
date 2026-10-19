@@ -64,11 +64,16 @@ try { $script:shell = New-Object -ComObject WScript.Shell } catch { $script:shel
 # ------------------------------------------------------------------- 参数
 $folderCols = 2          # 文件夹区宽度（列数）
 $fileRowMax = 5          # 单个文件类型最宽占几列
-$neutralCut = 0.15       # 彩度低于此值按灰白处理
-$uncertainCut = 0.25     # 彩度低于此值视为"不便分类"，应用图标放到应用区最底下
-$whiteLight = 0.80       # 亮于此值的彩色图标归入白色系
-$paleLight  = 0.50       # 灰白图标亮于此值归白，否则归黑
-$blackLight = 0.40       # 暗于此值的图标一律归黑色系
+# 颜色分类（v2：面积投票 + 中位色，规则移植自上一版 desktop-icon-arranger 工程）
+$whiteAreaCut = 0.50     # 近白像素占比达到此值 → 白色系
+$whiteMedCut  = 0.85     # 中位亮度达到此值 → 白色系
+$blackAreaCut = 0.50     # 近黑像素占比达到此值 → 黑色系
+$dominantCut  = 0.40     # 某色系占面积达到此值，直接采用它
+$darkMedCut   = 0.20     # 冷色占主导但中位亮度很低 → 黑色系
+$nearGraySat  = 0.12     # 中位色饱和度低于此值视为灰
+$darkGrayCut  = 0.25     # 灰且中位亮度很低 → 黑色系
+$grayHueCut   = 0.20     # 灰但仍有某色系占比达到此值 → 采用该色系
+$vividWeight  = 0.55     # 鲜明度 = 0.55×彩度 + 0.45×中位亮度（每行内左亮右暗）
 $marginX = 16            # 网格锚点兜底值（检测不到时使用）
 $marginY = 2
 $historyKeep = 30        # 历史栈最多保留多少份
@@ -79,7 +84,7 @@ $historyKeep = 30        # 历史栈最多保留多少份
 # 见 Get-AnchorsFromRows / Probe-Lattice / Initialize-GridInfo。
 $script:GridInfo = $null
 
-$familyOrder = @('WHITE', 'RED', 'ORANGE', 'YELLOW', 'GREEN', 'CYAN', 'BLUE', 'PURPLE', 'BLACK')
+$familyOrder = @('WHITE', 'RED', 'ORANGE', 'YELLOW', 'GREEN', 'CYAN', 'BLUE', 'PURPLE', 'BLACK', 'MIXED')
 
 $desk = [Environment]::GetFolderPath('Desktop')
 $pub  = [Environment]::GetFolderPath('CommonDesktopDirectory')
@@ -110,8 +115,8 @@ $special = @{}
 $special[$nameThisPC] = '::{20D04FE0-3AEA-1069-A2D8-08002B30309D}'
 $special[$nameBin]    = '::{645FF040-5081-101B-9F08-00AA002F954E}'
 $pinned = @{}
-$pinned[$nameThisPC] = @{ Hue = 208.0; CF = 0.55; Light = 0.58 }
-$pinned[$nameBin]    = @{ Hue = $null; CF = 0.05; Light = 0.80 }
+$pinned[$nameThisPC] = @{ Hue = 208.0; CF = 0.55; Light = 0.58; Family = 'BLUE' }
+$pinned[$nameBin]    = @{ Hue = $null; CF = 0.05; Light = 0.80; Family = 'WHITE' }
 
 # 快照目录
 $snapDir = Join-Path $script:Root 'snapshots'
@@ -169,13 +174,7 @@ function Get-Kind([string]$name) {
     return 'APP'
 }
 
-function Get-AppFamily([object]$hue, [double]$cf, [double]$light) {
-    if ($light -lt $blackLight) { return 'BLACK' }
-    if ($cf -lt $neutralCut -or $null -eq $hue) {
-        if ($light -ge $paleLight) { return 'WHITE' } else { return 'BLACK' }
-    }
-    if ($light -ge $whiteLight) { return 'WHITE' }
-    $h = [double]$hue
+function Get-HueFamily([double]$h) {
     if ($h -ge 330 -or $h -lt 15) { return 'RED' }
     if ($h -lt 45)  { return 'ORANGE' }
     if ($h -lt 70)  { return 'YELLOW' }
@@ -183,6 +182,33 @@ function Get-AppFamily([object]$hue, [double]$cf, [double]$light) {
     if ($h -lt 200) { return 'CYAN' }
     if ($h -lt 255) { return 'BLUE' }
     return 'PURPLE'
+}
+
+# v2 分类器：先按"面积投票"，再用"中位色"定案（规则移植自上一版工程）。
+#  1) 大面积是白，或中位色很亮            -> WHITE
+#  2) 大面积是黑                          -> BLACK
+#  3) 某一色系占了 ≥40% 面积：
+#       暖色（红橙黄）                    -> 就是它（暗底上的暖色很抢眼）
+#       冷色但中位色很暗                  -> BLACK（深藏青看上去就是黑）
+#       其余                              -> 就是它
+#  4) 没有色系占主导                      -> 看中位色的色相
+#  5) 中位色偏灰                          -> 若仍有色系占 ≥20% 面积就用它，否则 MIXED（杂色）
+function Get-AppFamily([object]$ci) {
+    if (-not $ci.Found) { return 'MIXED' }
+    if ($ci.WhiteFrac -ge $whiteAreaCut -or $ci.MedLight -ge $whiteMedCut) { return 'WHITE' }
+    if ($ci.BlackFrac -ge $blackAreaCut) { return 'BLACK' }
+    $names = @('RED', 'ORANGE', 'YELLOW', 'GREEN', 'CYAN', 'BLUE', 'PURPLE')
+    if ($ci.TopFamFrac -ge $dominantCut) {
+        if ($ci.TopFam -le 2) { return $names[$ci.TopFam] }
+        if ($ci.MedLight -le $darkMedCut) { return 'BLACK' }
+        return $names[$ci.TopFam]
+    }
+    if ($ci.MedSat -lt $nearGraySat) {
+        if ($ci.MedLight -le $darkGrayCut) { return 'BLACK' }
+        if ($ci.TopFamFrac -ge $grayHueCut) { return $names[$ci.TopFam] }
+        return 'MIXED'
+    }
+    return (Get-HueFamily $ci.MedHue)
 }
 
 # ================================================================ 快照读写
@@ -478,40 +504,50 @@ function Build-Plan {
     $folderTopRow   = [int][math]::Ceiling(($rows - $folderRowsUsed) / 2)
 
     # ---- 应用区：按颜色系分行，自上而下平滑渐变 ----
-    # 规则：①一行尽量同一色系 ②自上而下按色相平滑过渡 ③孤色系/难分类的图标放最底下。
-    # 文件区、文件夹区、此电脑/回收站这三个功能区的位置完全不动。
+    # 规则：①一行尽量同一色系 ②自上而下按色相平滑过渡 ③孤色系/杂色放最底下。
+    # 颜色分类（面积投票 + 中位色）与"每行左亮右暗"的排序，沿用上一版
+    # desktop-icon-arranger 工程的算法。前三个功能区的位置完全不动。
     $appInfo = foreach ($n in $appNames) {
         $found = $true
+        $keyHue = 0.0
+        $vivid = 0.0
         if ($pinned.ContainsKey($n)) {
-            $h = $pinned[$n].Hue; $cf = [double]$pinned[$n].CF; $lt = [double]$pinned[$n].Light
+            $fam = [string]$pinned[$n].Family
+            if ($null -ne $pinned[$n].Hue) { $keyHue = [double]$pinned[$n].Hue }
+            $vivid = 0.55 * [double]$pinned[$n].CF + 0.45 * [double]$pinned[$n].Light
         }
         else {
             $ci = [IconColorAnalyzer]::Analyze((Resolve-IconPath $n))
             $found = [bool]$ci.Found
-            $h  = if ($ci.Found -and $ci.Hue -ge 0) { [double]$ci.Hue } else { $null }
-            $cf = if ($ci.Found) { [double]$ci.Colorfulness } else { 0.0 }
-            $lt = if ($ci.Found) { [double]$ci.Lightness } else { 0.5 }
+            $fam = Get-AppFamily $ci
+            if ($ci.Found) {
+                if ($ci.MedHue -ge 0) { $keyHue = [double]$ci.MedHue }
+                # 鲜明度：用中位色的"彩度跨度"，而不是 HSL 饱和度
+                #（近白颜色的 HSL 饱和度会虚高）
+                $mx = [math]::Max($ci.MedR, [math]::Max($ci.MedG, $ci.MedB)) / 255.0
+                $mn = [math]::Min($ci.MedR, [math]::Min($ci.MedG, $ci.MedB)) / 255.0
+                $vivid = $vividWeight * ($mx - $mn) + (1 - $vividWeight) * [double]$ci.MedLight
+            }
         }
-        $fam = Get-AppFamily $h $cf $lt
         $forced = $familyOverride.ContainsKey($n)
         if ($forced) { $fam = $familyOverride[$n] }
+        if ($fam -eq 'RED' -and $keyHue -ge 330) { $keyHue -= 360 }
         [pscustomobject]@{
-            Name     = $n
-            Family   = $fam
-            Found    = $found
-            Forced   = $forced
-            CF       = [double]$cf
-            HueKey   = if ($null -ne $h -and $h -ge 330 -and $fam -eq 'RED') { [double]$h - 360 } else { if ($null -eq $h) { 0.0 } else { [double]$h } }
-            LightKey = -1 * $lt
+            Name   = $n
+            Family = $fam
+            Found  = $found
+            Forced = $forced
+            HueKey = $keyHue
+            Vivid  = $vivid
         }
     }
 
-    # ① 难分类：读不到颜色，或颜色太灰、拿不准（手动指定过色系的不算）
+    # ① 杂色：算法读不出主色的图标（手动指定过色系的不算）
     $isBottom = @{}
     foreach ($a in $appInfo) {
-        if (-not $a.Forced -and (-not $a.Found -or $a.CF -lt $uncertainCut)) { $isBottom[$a.Name] = $true }
+        if (-not $a.Forced -and $a.Family -eq 'MIXED') { $isBottom[$a.Name] = $true }
     }
-    # ② 孤色系：去掉难分类的以后，某个色系只剩一个图标，也跟着去底部
+    # ② 孤色系：去掉杂色以后，某个色系只剩一个图标，也跟着去底部
     $famLeft = @{}
     foreach ($a in $appInfo) {
         if ($isBottom.ContainsKey($a.Name)) { continue }
@@ -521,16 +557,14 @@ function Build-Plan {
         if (-not $isBottom.ContainsKey($a.Name) -and $famLeft[$a.Family] -le 1) { $isBottom[$a.Name] = $true }
     }
 
-    # 按色系顺序排出"自上而下的渐变"；每个色系内部按色相（黑白按明度）排
+    # 按色系顺序排出"自上而下的渐变"；每个色系内部再按色相衔接
     function Get-AppOrder([bool]$wantBottom) {
         $out = @()
         foreach ($f in $familyOrder) {
             $m = @($appInfo | Where-Object {
                     (([bool]$isBottom.ContainsKey($_.Name)) -eq $wantBottom) -and $_.Family -eq $f })
             if ($m.Count -eq 0) { continue }
-            if ($f -eq 'WHITE' -or $f -eq 'BLACK') { $m = @($m | Sort-Object LightKey, Name) }
-            else { $m = @($m | Sort-Object HueKey, Name) }
-            $out += $m
+            $out += @($m | Sort-Object @{ Expression = 'HueKey' }, @{ Expression = 'Name' })
         }
         return $out
     }
@@ -612,8 +646,15 @@ function Build-Plan {
     for ($i = 0; $i -lt $specialNames.Count; $i++) {
         Add-Cell $specialNames[$i] $specialCol ($specialTopRow + $i) 'SPECIAL'
     }
+    # 逐行落地。每行内按 色系 -> 鲜明度(降) -> 色相 -> 名称 再排一次：
+    #   · 一行从左到右 亮/艳 -> 暗/灰，视觉上有干净的横向渐变；
+    #   · 相邻两行的同一列落在渐变的同一位置，纵向也接得上（蛇形填充正好相反）。
     for ($r = 0; $r -lt $groups.Count; $r++) {
-        $items = @($groups[$r].Items)
+        $items = @($groups[$r].Items | Sort-Object `
+                @{ Expression = { $familyOrder.IndexOf($_.Family) } }, `
+                @{ Expression = 'Vivid'; Descending = $true }, `
+                @{ Expression = 'HueKey' }, `
+                @{ Expression = 'Name' })
         $start = $appZoneRight - $items.Count + 1
         for ($i = 0; $i -lt $items.Count; $i++) {
             Add-Cell $items[$i].Name ($start + $i) ($appTopRow + $r) ('APP ' + $items[$i].Family)

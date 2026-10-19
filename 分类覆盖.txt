@@ -8,7 +8,7 @@
 #  格式：    图标名 = 取值             （等号两边空格随意）
 #
 #  取值可以是两种：
-#     · 颜色系：WHITE  RED  ORANGE  YELLOW  GREEN  CYAN  BLUE  PURPLE  BLACK
+#     · 颜色系：WHITE  RED  ORANGE  YELLOW  GREEN  CYAN  BLUE  PURPLE  BLACK  MIXED
 #     · 区域　：FILE（临时文件） FOLDER（文件夹） APP（应用软件）
 #               SPECIAL（此电脑 / 回收站）
 #
