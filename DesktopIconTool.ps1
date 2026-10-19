@@ -65,6 +65,7 @@ try { $script:shell = New-Object -ComObject WScript.Shell } catch { $script:shel
 $folderCols = 2          # 文件夹区宽度（列数）
 $fileRowMax = 5          # 单个文件类型最宽占几列
 $neutralCut = 0.15       # 彩度低于此值按灰白处理
+$uncertainCut = 0.25     # 彩度低于此值视为"不便分类"，应用图标放到应用区最底下
 $whiteLight = 0.80       # 亮于此值的彩色图标归入白色系
 $paleLight  = 0.50       # 灰白图标亮于此值归白，否则归黑
 $blackLight = 0.40       # 暗于此值的图标一律归黑色系
@@ -476,9 +477,107 @@ function Build-Plan {
     $folderRowsUsed = [int][math]::Ceiling($folderNames.Count / $folderCols)
     $folderTopRow   = [int][math]::Ceiling(($rows - $folderRowsUsed) / 2)
 
+    # ---- 应用区：按颜色系分行，自上而下平滑渐变 ----
+    # 规则：①一行尽量同一色系 ②自上而下按色相平滑过渡 ③孤色系/难分类的图标放最底下。
+    # 文件区、文件夹区、此电脑/回收站这三个功能区的位置完全不动。
+    $appInfo = foreach ($n in $appNames) {
+        $found = $true
+        if ($pinned.ContainsKey($n)) {
+            $h = $pinned[$n].Hue; $cf = [double]$pinned[$n].CF; $lt = [double]$pinned[$n].Light
+        }
+        else {
+            $ci = [IconColorAnalyzer]::Analyze((Resolve-IconPath $n))
+            $found = [bool]$ci.Found
+            $h  = if ($ci.Found -and $ci.Hue -ge 0) { [double]$ci.Hue } else { $null }
+            $cf = if ($ci.Found) { [double]$ci.Colorfulness } else { 0.0 }
+            $lt = if ($ci.Found) { [double]$ci.Lightness } else { 0.5 }
+        }
+        $fam = Get-AppFamily $h $cf $lt
+        if ($familyOverride.ContainsKey($n)) { $fam = $familyOverride[$n] }
+        [pscustomobject]@{
+            Name     = $n
+            Family   = $fam
+            Found    = $found
+            CF       = [double]$cf
+            HueKey   = if ($null -ne $h -and $h -ge 330 -and $fam -eq 'RED') { [double]$h - 360 } else { if ($null -eq $h) { 0.0 } else { [double]$h } }
+            LightKey = -1 * $lt
+        }
+    }
+
+    # ① 难分类：读不到颜色，或颜色太灰、拿不准
+    $isBottom = @{}
+    foreach ($a in $appInfo) {
+        if (-not $a.Found -or $a.CF -lt $uncertainCut) { $isBottom[$a.Name] = $true }
+    }
+    # ② 孤色系：去掉难分类的以后，某个色系只剩一个图标，也跟着去底部
+    $famLeft = @{}
+    foreach ($a in $appInfo) {
+        if ($isBottom.ContainsKey($a.Name)) { continue }
+        if ($famLeft.ContainsKey($a.Family)) { $famLeft[$a.Family]++ } else { $famLeft[$a.Family] = 1 }
+    }
+    foreach ($a in $appInfo) {
+        if (-not $isBottom.ContainsKey($a.Name) -and $famLeft[$a.Family] -le 1) { $isBottom[$a.Name] = $true }
+    }
+
+    # 按色系顺序排出"自上而下的渐变"；每个色系内部按色相（黑白按明度）排
+    function Get-AppOrder([bool]$wantBottom) {
+        $out = @()
+        foreach ($f in $familyOrder) {
+            $m = @($appInfo | Where-Object {
+                    (([bool]$isBottom.ContainsKey($_.Name)) -eq $wantBottom) -and $_.Family -eq $f })
+            if ($m.Count -eq 0) { continue }
+            if ($f -eq 'WHITE' -or $f -eq 'BLACK') { $m = @($m | Sort-Object LightKey, Name) }
+            else { $m = @($m | Sort-Object HueKey, Name) }
+            $out += $m
+        }
+        return $out
+    }
+    $orderedNormal = @(Get-AppOrder $false)
+    $orderedBottom = @(Get-AppOrder $true)
+
+    # 把有序的图标切成行：换色系就换行，一行最多 $Width 个。
+    # $SingleFamily = 底部杂项桶（孤色系/难分类）整体当作一个色系，不因换色系再断行。
+    function Get-AppRowGroups([object[]]$Ordered, [int]$Width, [bool]$SingleFamily) {
+        $g = @(); $curFam = $null; $cur = @()
+        foreach ($a in $Ordered) {
+            $fam = if ($SingleFamily) { 'MISC' } else { $a.Family }
+            if ($cur.Count -gt 0 -and ($cur.Count -ge $Width -or $curFam -ne $fam)) {
+                $g += , @{ Family = $curFam; Items = @($cur) }
+                $cur = @(); $curFam = $null
+            }
+            if ($null -eq $curFam) { $curFam = $fam }
+            $cur += $a
+        }
+        if ($cur.Count -gt 0) { $g += , @{ Family = $curFam; Items = @($cur) } }
+        return $g
+    }
+
+    # 先按当前宽度分行；行数超过屏幕时，合并相邻两行（优先合并后仍放得下的最小组合）；
+    # 实在合并不了就加宽一列再试，宁可应用区多占一列，也不把两行硬塞。
+    $appColWidth = [math]::Max(1, [int][math]::Ceiling($appNames.Count / [math]::Max(1, $rows)))
+    $groups = @()
+    while ($true) {
+        $g = New-Object System.Collections.ArrayList
+        foreach ($x in @(Get-AppRowGroups $orderedNormal $appColWidth $false)) { [void]$g.Add($x) }
+        foreach ($x in @(Get-AppRowGroups $orderedBottom $appColWidth $true)) { [void]$g.Add($x) }
+        while ($g.Count -gt $rows) {
+            $bestI = -1; $bestSum = [int]::MaxValue
+            for ($i = 0; $i -lt $g.Count - 1; $i++) {
+                $s = @($g[$i].Items).Count + @($g[$i + 1].Items).Count
+                if ($s -le $appColWidth -and $s -lt $bestSum) { $bestSum = $s; $bestI = $i }
+            }
+            if ($bestI -lt 0) { break }
+            $a = $g[$bestI]; $b = $g[$bestI + 1]
+            $g[$bestI] = @{ Family = ($a.Family + '+' + $b.Family); Items = @(@($a.Items) + @($b.Items)) }
+            $g.RemoveAt($bestI + 1)
+        }
+        $groups = @($g)
+        if ($groups.Count -le $rows -or $appColWidth -ge $cols) { break }
+        $appColWidth++
+    }
+
     $appZoneRight  = $cols - 1
-    $appColWidth   = [math]::Max(1, [int][math]::Ceiling($appNames.Count / [math]::Max(1, $rows)))
-    $appRowCount   = if ($appNames.Count -gt 0) { [int][math]::Ceiling($appNames.Count / $appColWidth) } else { 0 }
+    $appRowCount   = $groups.Count
     $appTopRow     = [int][math]::Ceiling(($rows - $appRowCount) / 2)
     $appZoneLeft   = $appZoneRight - $appColWidth + 1
     $specialCol    = $appZoneLeft - 2
@@ -490,36 +589,6 @@ function Build-Plan {
     if ($appRowCount -gt $rows)     { throw "应用区需要 $appRowCount 行，但所选屏幕只有 $rows 行。" }
     if ($specialCol -le ($folderZoneCol + $folderCols - 1)) {
         throw "横向空间不足：应用区需要 $appColWidth 列，会和文件夹区相撞。减少桌面图标，或选更宽的屏幕。"
-    }
-
-    # 应用图标颜色分析
-    $appInfo = foreach ($n in $appNames) {
-        if ($pinned.ContainsKey($n)) {
-            $h = $pinned[$n].Hue; $cf = [double]$pinned[$n].CF; $lt = [double]$pinned[$n].Light
-        }
-        else {
-            $ci = [IconColorAnalyzer]::Analyze((Resolve-IconPath $n))
-            $h  = if ($ci.Found -and $ci.Hue -ge 0) { [double]$ci.Hue } else { $null }
-            $cf = if ($ci.Found) { [double]$ci.Colorfulness } else { 0.0 }
-            $lt = if ($ci.Found) { [double]$ci.Lightness } else { 0.5 }
-        }
-        $fam = Get-AppFamily $h $cf $lt
-        if ($familyOverride.ContainsKey($n)) { $fam = $familyOverride[$n] }
-        [pscustomobject]@{
-            Name     = $n
-            Family   = $fam
-            HueKey   = if ($null -ne $h -and $h -ge 330 -and $fam -eq 'RED') { [double]$h - 360 } else { if ($null -eq $h) { 0.0 } else { [double]$h } }
-            LightKey = -1 * $lt
-        }
-    }
-
-    $appSorted = @()
-    foreach ($f in $familyOrder) {
-        $members = @($appInfo | Where-Object { $_.Family -eq $f })
-        if ($members.Count -eq 0) { continue }
-        if ($f -eq 'WHITE' -or $f -eq 'BLACK') { $members = @($members | Sort-Object LightKey, Name) }
-        else { $members = @($members | Sort-Object HueKey, Name) }
-        $appSorted += $members
     }
 
     $plan = New-Object System.Collections.ArrayList
@@ -541,10 +610,21 @@ function Build-Plan {
     for ($i = 0; $i -lt $specialNames.Count; $i++) {
         Add-Cell $specialNames[$i] $specialCol ($specialTopRow + $i) 'SPECIAL'
     }
-    for ($i = 0; $i -lt $appSorted.Count; $i++) {
-        $r = $appTopRow + [int][math]::Floor($i / $appColWidth)
-        $inRow = [int][math]::Min($appColWidth, $appSorted.Count - ($r - $appTopRow) * $appColWidth)
-        Add-Cell $appSorted[$i].Name ($appZoneRight - $inRow + 1 + ($i % $appColWidth)) $r ('APP ' + $appSorted[$i].Family)
+    for ($r = 0; $r -lt $groups.Count; $r++) {
+        $items = @($groups[$r].Items)
+        $start = $appZoneRight - $items.Count + 1
+        for ($i = 0; $i -lt $items.Count; $i++) {
+            Add-Cell $items[$i].Name ($start + $i) ($appTopRow + $r) ('APP ' + $items[$i].Family)
+        }
+    }
+
+    $appRowsDetail = @()
+    for ($r = 0; $r -lt $groups.Count; $r++) {
+        $appRowsDetail += [pscustomobject]@{
+            Row    = $appTopRow + $r
+            Family = $groups[$r].Family
+            Names  = @($groups[$r].Items | ForEach-Object { $_.Name })
+        }
     }
 
     return [pscustomobject]@{
@@ -562,6 +642,7 @@ function Build-Plan {
         AppZoneLeft = $appZoneLeft
         AppZoneRight = $appZoneRight
         SpecialCol = $specialCol
+        AppRows = @($appRowsDetail)
     }
 }
 
@@ -888,6 +969,12 @@ function Invoke-Arrange {
         Write-Host ("目标屏幕：屏幕{0}（{1}）  {2}×{3}   可用格 {4} 列 × {5} 行" -f ($mon.Index + 1), $tag, ($mon.Right - $mon.Left), ($mon.Bottom - $mon.Top), $geo.Cols, $geo.Rows) -ForegroundColor Cyan
         Write-Host ("  区域统计：文件 {0}（{1} 行）  文件夹 {2}  此电脑/回收站 {3}  应用 {4}" -f $built.FileCount, $built.FileRows, $built.FolderCount, $built.SpecialCount, $built.AppCount)
         Write-Host ("  文件区占 {0} 列，文件夹区第 {1} 列起，应用区第 {2}~{3} 列" -f $built.FileZoneWidth, ($built.FolderZoneCol + 1), ($built.AppZoneLeft + 1), ($built.AppZoneRight + 1)) -ForegroundColor DarkGray
+        if ($built.AppRows.Count) {
+            Write-Host "  应用区配色（自上而下）：" -ForegroundColor DarkGray
+            foreach ($row in $built.AppRows) {
+                Write-Host ("    第 {0} 行  {1}：{2}" -f ($row.Row + 1), $row.Family, (@($row.Names) -join '、')) -ForegroundColor DarkGray
+            }
+        }
         if ($overrideNotes.Count) { foreach ($n in $overrideNotes) { Write-Host "  $n" -ForegroundColor DarkYellow } }
 
         if ($Action -eq 'Preview') {
