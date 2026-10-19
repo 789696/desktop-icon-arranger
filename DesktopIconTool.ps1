@@ -26,8 +26,8 @@ param(
     [string]$Action = 'Menu',
     [int]$Monitor = -1,      # 0 基的屏幕序号；-1 = 自动（图标最多的那块屏）
     [switch]$Yes,            # 需要确认的操作不再询问
-    [ValidateSet('Strict', 'Packed')]
-    [string]$Strategy = 'Strict',  # 应用区策略：Strict=严格一行一个色系；Packed=逐行填满
+    [ValidateSet('Strict', 'Compact', 'Packed')]
+    [string]$Strategy = 'Compact',  # 应用区策略：Compact=一行一个色系、必要时相邻色系拼行压行数（默认）；Strict=严格一行一个色系；Packed=逐行填满
     [string]$Out = ''              # Render 动作的输出图片路径（留空则写到 snapshots\）
 )
 
@@ -591,8 +591,55 @@ function Build-Plan {
         return $g
     }
 
+    # 紧凑拼行（默认）：按色系顺序逐行填满宽度。
+    #   · 某个色系自己一行都放不下（个数 > 宽度）时，才把它拆开续到下一行；
+    #   · 只放得下但当前行已经放不进去时，另起一行，保持这个色系完整；
+    #   · 于是青色、黑色、孤色系这类小色系会自然拼进邻行的空位，把行数压到最少。
+    # 结果：色系带尽量完整，同时整个应用区行数最少、上下留白。
+    function Get-CompactRowGroups([object[]]$Ordered, [int]$Width) {
+        $g = @(); $curFam = $null; $cur = @()
+        $i = 0; $n = @($Ordered).Count
+        while ($i -lt $n) {
+            $fam = $Ordered[$i].Family
+            $run = 0
+            while ((($i + $run) -lt $n) -and ($Ordered[$i + $run].Family -eq $fam)) { $run++ }
+            if ($run -gt $Width) {
+                # 比一整行还长：先补满当前行，再整行整行地放，最后一段留给后面的色系补位
+                for ($k = 0; $k -lt $run; $k++) {
+                    if ($cur.Count -ge $Width) { $g += , @{ Family = $curFam; Items = @($cur) }; $cur = @(); $curFam = $null }
+                    if ($null -eq $curFam) { $curFam = $fam }
+                    $cur += $Ordered[$i + $k]
+                }
+            }
+            elseif (($cur.Count -eq 0) -or (($cur.Count + $run) -le $Width)) {
+                # 当前行还放得下 → 并进去
+                if ($null -eq $curFam) { $curFam = $fam }
+                for ($k = 0; $k -lt $run; $k++) { $cur += $Ordered[$i + $k] }
+            }
+            else {
+                # 放不下又不满一行 → 另起一行，不拆色系
+                $g += , @{ Family = $curFam; Items = @($cur) }
+                $cur = @(); $curFam = $fam
+                for ($k = 0; $k -lt $run; $k++) { $cur += $Ordered[$i + $k] }
+            }
+            $i += $run
+        }
+        if ($cur.Count -gt 0) { $g += , @{ Family = $curFam; Items = @($cur) } }
+        return $g
+    }
+
     $appColWidth = [math]::Max(1, [int][math]::Ceiling($appNames.Count / [math]::Max(1, $rows)))
-    if ($Strategy -eq 'Packed') {
+    if ($Strategy -eq 'Compact') {
+        # 紧凑拼行：行数已经是最少的；万一还是超过屏幕行数，就加宽一列再试。
+        $all = @($orderedNormal) + @($orderedBottom)
+        $groups = @()
+        while ($true) {
+            $groups = @(Get-CompactRowGroups $all $appColWidth)
+            if ($groups.Count -le $rows -or $appColWidth -ge $cols) { break }
+            $appColWidth++
+        }
+    }
+    elseif ($Strategy -eq 'Packed') {
         # 旧工程的做法：整条颜色带按宽度逐行填满，行尾可以接上下一个色系的开头；
         # 每一行都是满的（只有最后一行可能不满），右边不留缺口。
         $all = @($orderedNormal) + @($orderedBottom)
@@ -1073,7 +1120,7 @@ function Invoke-Arrange {
 }
 
 # ================================================================ 效果预览图
-# 把"现在的排列 / 严格分行 / 拼行填满"三种画法画成一张对比图，不动真实图标。
+# 把"现在的排列 / 紧凑拼行 / 严格分行"三种画法画成一张对比图，不动真实图标。
 
 function Get-ShIconBitmap([string]$path) {
     if (-not (Test-DotNetType 'ShIconDump')) {
@@ -1187,10 +1234,10 @@ function Invoke-Render {
         $panels += @{ Title = 'A. 现在（你的桌面）'; Plan = $now }
 
         $savedStrategy = $Strategy
-        foreach ($st in @('Strict', 'Packed')) {
+        foreach ($st in @('Compact', 'Strict')) {
             $script:Strategy = $st
             $b = Build-Plan $raw $geo $mons $view
-            $title = if ($st -eq 'Strict') { 'B. 严格分行：一行一个色系' } else { 'C. 拼行填满：行尾接下一个色系' }
+            $title = if ($st -eq 'Compact') { 'B. 紧凑拼行：一行一个色系，必要时拼行（默认）' } else { 'C. 严格分行：一行一个色系，不拼行' }
             $panels += @{ Title = $title; Plan = @($b.Plan) }
             Write-Host ""
             Write-Host ("[{0}] 应用区配色（自上而下）：" -f $st) -ForegroundColor Cyan

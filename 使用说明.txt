@@ -125,10 +125,15 @@
      powershell -ExecutionPolicy Bypass -File DesktopIconTool.ps1 -Action Render -Monitor 1 -Out D:\对比图.png
   可用的 -Action：Menu（默认，交互菜单）、Info、Check、Preview、
   Arrange、Save、Apply、Undo、Original、Render。
-  · Render：把「现在 / 严格分行 / 拼行填满」三种画法渲染成一张 PNG 对比图，
+  · Render：把「现在 / 紧凑拼行 / 严格分行」三种画法渲染成一张 PNG 对比图，
     不动真实图标；-Out 指定输出路径，留空则写到 snapshots 文件夹。
-  · -Strategy Strict（默认，一行一个色系）/ Packed（逐行填满，行尾接下一个色系）。
-    只有在你明确想要「应用区行行填满、右边不留缺口」时才用 Packed。
+  · -Strategy Compact（默认）/ Strict / Packed，三种应用区排法：
+      Compact：一行尽量一个色系；只有当某个色系自己一行都放不下、或者
+               相邻小色系拼一下能少占一行时，才允许拼行。行数最少、上下留白，
+               色系带也尽量完整。这是菜单里用的排法。
+      Strict ：严格一行一个色系，换色系就换行（行数最多、每列最整齐）。
+      Packed ：整条颜色带逐行填满，行尾直接接下一个色系的开头，右边不留缺口。
+    想换排法时用 -Strategy Strict 或 -Strategy Packed 单独调用即可。
 
 【已知限制】
   · 多显示器缩放比例不一致时（例如主屏 200%、副屏 100%），每块屏幕的图标
