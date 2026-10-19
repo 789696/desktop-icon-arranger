@@ -493,21 +493,23 @@ function Build-Plan {
             $lt = if ($ci.Found) { [double]$ci.Lightness } else { 0.5 }
         }
         $fam = Get-AppFamily $h $cf $lt
-        if ($familyOverride.ContainsKey($n)) { $fam = $familyOverride[$n] }
+        $forced = $familyOverride.ContainsKey($n)
+        if ($forced) { $fam = $familyOverride[$n] }
         [pscustomobject]@{
             Name     = $n
             Family   = $fam
             Found    = $found
+            Forced   = $forced
             CF       = [double]$cf
             HueKey   = if ($null -ne $h -and $h -ge 330 -and $fam -eq 'RED') { [double]$h - 360 } else { if ($null -eq $h) { 0.0 } else { [double]$h } }
             LightKey = -1 * $lt
         }
     }
 
-    # ① 难分类：读不到颜色，或颜色太灰、拿不准
+    # ① 难分类：读不到颜色，或颜色太灰、拿不准（手动指定过色系的不算）
     $isBottom = @{}
     foreach ($a in $appInfo) {
-        if (-not $a.Found -or $a.CF -lt $uncertainCut) { $isBottom[$a.Name] = $true }
+        if (-not $a.Forced -and (-not $a.Found -or $a.CF -lt $uncertainCut)) { $isBottom[$a.Name] = $true }
     }
     # ② 孤色系：去掉难分类的以后，某个色系只剩一个图标，也跟着去底部
     $famLeft = @{}
