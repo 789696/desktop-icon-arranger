@@ -53,6 +53,25 @@ public static class DeskNative
     public static extern IntPtr SendMessageW(IntPtr hWnd, uint msg, IntPtr wParam, StringBuilder lParam);
     [DllImport("user32.dll")]
     public static extern bool SetProcessDPIAware();
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern bool SetProcessDpiAwarenessContext(IntPtr value);
+
+    // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+    static readonly IntPtr PER_MONITOR_AWARE_V2 = new IntPtr(-4);
+
+    // The desktop SysListView32 and the monitor rectangles only share one
+    // coordinate space when this process is per-monitor DPI aware.  With plain
+    // "system" awareness a 200% primary monitor makes GetSystemMetrics report a
+    // virtual desktop twice as wide as the list view really is, and icons land
+    // in the wrong place.  Per-monitor-v2 is therefore the correct mode; fall
+    // back to the old call on Windows versions that do not know it.
+    public static void EnableBestDpiAwareness()
+    {
+        try { if (SetProcessDpiAwarenessContext(PER_MONITOR_AWARE_V2)) return; }
+        catch { }
+        try { SetProcessDPIAware(); }
+        catch { }
+    }
     [DllImport("user32.dll", EntryPoint = "GetWindowLongPtrW")]
     public static extern IntPtr GetWindowLongPtr(IntPtr hWnd, int index);
     [DllImport("shlwapi.dll", CharSet = CharSet.Unicode, ExactSpelling = true)]
@@ -71,6 +90,87 @@ public static class DeskNative
         if (SystemParametersInfo(SPI_GETWORKAREA, 0, out r, 0))
             return new int[] { r.left, r.top, r.right, r.bottom };
         return null;
+    }
+
+    // ------------------------------------------------------------- monitors
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    public struct MONITORINFO
+    {
+        public int cbSize;
+        public RECT rcMonitor;
+        public RECT rcWork;
+        public uint dwFlags;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string szDevice;
+    }
+
+    public delegate bool MonitorEnumProc(IntPtr hMonitor, IntPtr hdc, ref RECT lprcMonitor, IntPtr dwData);
+
+    [DllImport("user32.dll")]
+    public static extern bool EnumDisplayMonitors(IntPtr hdc, IntPtr lprcClip, MonitorEnumProc lpfnEnum, IntPtr dwData);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    public static extern bool GetMonitorInfo(IntPtr hMonitor, ref MONITORINFO lpmi);
+
+    public const int SM_XVIRTUALSCREEN = 76;
+    public const int SM_YVIRTUALSCREEN = 77;
+    public const int SM_CXVIRTUALSCREEN = 78;
+    public const int SM_CYVIRTUALSCREEN = 79;
+
+    // Every monitor in physical virtual-desktop pixels:
+    //   { monLeft, monTop, monRight, monBottom, workLeft, workTop, workRight, workBottom, isPrimary }
+    public static int[][] GetMonitors()
+    {
+        List<int[]> list = new List<int[]>();
+        MonitorEnumProc cb = delegate(IntPtr hMon, IntPtr hdc, ref RECT rc, IntPtr data)
+        {
+            MONITORINFO mi = new MONITORINFO();
+            mi.cbSize = Marshal.SizeOf(typeof(MONITORINFO));
+            if (GetMonitorInfo(hMon, ref mi))
+            {
+                list.Add(new int[] {
+                    mi.rcMonitor.left, mi.rcMonitor.top, mi.rcMonitor.right, mi.rcMonitor.bottom,
+                    mi.rcWork.left, mi.rcWork.top, mi.rcWork.right, mi.rcWork.bottom,
+                    (mi.dwFlags & 1) != 0 ? 1 : 0
+                });
+            }
+            return true;
+        };
+        EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, cb, IntPtr.Zero);
+        list.Sort(delegate(int[] a, int[] b) { return a[0] != b[0] ? a[0] - b[0] : a[1] - b[1]; });
+        return list.ToArray();
+    }
+
+    // Bounding box of the whole virtual desktop in physical pixels: { left, top, right, bottom }.
+    public static int[] GetVirtualRect()
+    {
+        int x = GetSystemMetrics(SM_XVIRTUALSCREEN);
+        int y = GetSystemMetrics(SM_YVIRTUALSCREEN);
+        int w = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+        int h = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+        if (w <= 0 || h <= 0) return null;
+        return new int[] { x, y, x + w, y + h };
+    }
+
+    // Effective DPI of each monitor.  Used to scale the icon grid: a 96-DPI
+    // monitor uses a grid half as wide as the same layout on a 192-DPI monitor.
+    //   { monLeft, monTop, dpiX, dpiY, hresult }
+    [DllImport("shcore.dll")]
+    public static extern int GetDpiForMonitor(IntPtr hmonitor, int dpiType, out uint dpiX, out uint dpiY);
+
+    public static int[][] GetMonitorDpis()
+    {
+        List<int[]> list = new List<int[]>();
+        MonitorEnumProc cb = delegate(IntPtr hMon, IntPtr hdc, ref RECT rc, IntPtr data)
+        {
+            uint dx = 0, dy = 0;
+            int hr = -1;
+            try { hr = GetDpiForMonitor(hMon, 0, out dx, out dy); }
+            catch { }
+            list.Add(new int[] { rc.left, rc.top, (int)dx, (int)dy, hr });
+            return true;
+        };
+        EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, cb, IntPtr.Zero);
+        list.Sort(delegate(int[] a, int[] b) { return a[0] != b[0] ? a[0] - b[0] : a[1] - b[1]; });
+        return list.ToArray();
     }
 
     [DllImport("kernel32.dll", SetLastError = true)]
