@@ -122,8 +122,13 @@
      powershell -ExecutionPolicy Bypass -File DesktopIconTool.ps1 -Action Info
      powershell -ExecutionPolicy Bypass -File DesktopIconTool.ps1 -Action Preview -Monitor 1
      powershell -ExecutionPolicy Bypass -File DesktopIconTool.ps1 -Action Arrange -Monitor 1 -Yes
+     powershell -ExecutionPolicy Bypass -File DesktopIconTool.ps1 -Action Render -Monitor 1 -Out D:\对比图.png
   可用的 -Action：Menu（默认，交互菜单）、Info、Check、Preview、
-  Arrange、Save、Apply、Undo、Original。
+  Arrange、Save、Apply、Undo、Original、Render。
+  · Render：把「现在 / 严格分行 / 拼行填满」三种画法渲染成一张 PNG 对比图，
+    不动真实图标；-Out 指定输出路径，留空则写到 snapshots 文件夹。
+  · -Strategy Strict（默认，一行一个色系）/ Packed（逐行填满，行尾接下一个色系）。
+    只有在你明确想要「应用区行行填满、右边不留缺口」时才用 Packed。
 
 【已知限制】
   · 多显示器缩放比例不一致时（例如主屏 200%、副屏 100%），每块屏幕的图标

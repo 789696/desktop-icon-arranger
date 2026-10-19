@@ -22,10 +22,13 @@
       · 只用 Windows PowerShell 5.1 与 .NET Framework，免安装、免联网、免管理员。
 #>
 param(
-    [ValidateSet('Menu', 'Info', 'Check', 'Preview', 'Arrange', 'Save', 'Apply', 'Undo', 'Original')]
+    [ValidateSet('Menu', 'Info', 'Check', 'Preview', 'Arrange', 'Save', 'Apply', 'Undo', 'Original', 'Render')]
     [string]$Action = 'Menu',
     [int]$Monitor = -1,      # 0 基的屏幕序号；-1 = 自动（图标最多的那块屏）
-    [switch]$Yes             # 需要确认的操作不再询问
+    [switch]$Yes,            # 需要确认的操作不再询问
+    [ValidateSet('Strict', 'Packed')]
+    [string]$Strategy = 'Strict',  # 应用区策略：Strict=严格一行一个色系；Packed=逐行填满
+    [string]$Out = ''              # Render 动作的输出图片路径（留空则写到 snapshots\）
 )
 
 $ErrorActionPreference = 'Stop'
@@ -588,28 +591,41 @@ function Build-Plan {
         return $g
     }
 
-    # 先按当前宽度分行；行数超过屏幕时，合并相邻两行（优先合并后仍放得下的最小组合）；
-    # 实在合并不了就加宽一列再试，宁可应用区多占一列，也不把两行硬塞。
     $appColWidth = [math]::Max(1, [int][math]::Ceiling($appNames.Count / [math]::Max(1, $rows)))
-    $groups = @()
-    while ($true) {
-        $g = New-Object System.Collections.ArrayList
-        foreach ($x in @(Get-AppRowGroups $orderedNormal $appColWidth $false)) { [void]$g.Add($x) }
-        foreach ($x in @(Get-AppRowGroups $orderedBottom $appColWidth $true)) { [void]$g.Add($x) }
-        while ($g.Count -gt $rows) {
-            $bestI = -1; $bestSum = [int]::MaxValue
-            for ($i = 0; $i -lt $g.Count - 1; $i++) {
-                $s = @($g[$i].Items).Count + @($g[$i + 1].Items).Count
-                if ($s -le $appColWidth -and $s -lt $bestSum) { $bestSum = $s; $bestI = $i }
-            }
-            if ($bestI -lt 0) { break }
-            $a = $g[$bestI]; $b = $g[$bestI + 1]
-            $g[$bestI] = @{ Family = ($a.Family + '+' + $b.Family); Items = @(@($a.Items) + @($b.Items)) }
-            $g.RemoveAt($bestI + 1)
+    if ($Strategy -eq 'Packed') {
+        # 旧工程的做法：整条颜色带按宽度逐行填满，行尾可以接上下一个色系的开头；
+        # 每一行都是满的（只有最后一行可能不满），右边不留缺口。
+        $all = @($orderedNormal) + @($orderedBottom)
+        $groups = @()
+        for ($i = 0; $i -lt $all.Count; $i += $appColWidth) {
+            $end = [math]::Min($i + $appColWidth - 1, $all.Count - 1)
+            $groups += , @{ Family = 'PACKED'; Items = @($all[$i..$end]) }
         }
-        $groups = @($g)
-        if ($groups.Count -le $rows -or $appColWidth -ge $cols) { break }
-        $appColWidth++
+    }
+    else {
+        # Strict：一行一个色系，换色系就换行。
+        # 行数超过屏幕时，合并相邻两行（优先合并后仍放得下的最小组合）；
+        # 实在合并不了就加宽一列再试，宁可应用区多占一列，也不把两行硬塞。
+        $groups = @()
+        while ($true) {
+            $g = New-Object System.Collections.ArrayList
+            foreach ($x in @(Get-AppRowGroups $orderedNormal $appColWidth $false)) { [void]$g.Add($x) }
+            foreach ($x in @(Get-AppRowGroups $orderedBottom $appColWidth $true)) { [void]$g.Add($x) }
+            while ($g.Count -gt $rows) {
+                $bestI = -1; $bestSum = [int]::MaxValue
+                for ($i = 0; $i -lt $g.Count - 1; $i++) {
+                    $s = @($g[$i].Items).Count + @($g[$i + 1].Items).Count
+                    if ($s -le $appColWidth -and $s -lt $bestSum) { $bestSum = $s; $bestI = $i }
+                }
+                if ($bestI -lt 0) { break }
+                $a = $g[$bestI]; $b = $g[$bestI + 1]
+                $g[$bestI] = @{ Family = ($a.Family + '+' + $b.Family); Items = @(@($a.Items) + @($b.Items)) }
+                $g.RemoveAt($bestI + 1)
+            }
+            $groups = @($g)
+            if ($groups.Count -le $rows -or $appColWidth -ge $cols) { break }
+            $appColWidth++
+        }
     }
 
     $appZoneRight  = $cols - 1
@@ -663,10 +679,16 @@ function Build-Plan {
 
     $appRowsDetail = @()
     for ($r = 0; $r -lt $groups.Count; $r++) {
+        $its = @($groups[$r].Items | Sort-Object `
+                @{ Expression = { $familyOrder.IndexOf($_.Family) } }, `
+                @{ Expression = 'Vivid'; Descending = $true }, `
+                @{ Expression = 'HueKey' }, `
+                @{ Expression = 'Name' })
+        $fams = @($its | ForEach-Object { $_.Family } | Select-Object -Unique)
         $appRowsDetail += [pscustomobject]@{
             Row    = $appTopRow + $r
-            Family = $groups[$r].Family
-            Names  = @($groups[$r].Items | ForEach-Object { $_.Name })
+            Family = ($fams -join '+')
+            Names  = @($its | ForEach-Object { $_.Name })
         }
     }
 
@@ -1050,6 +1072,170 @@ function Invoke-Arrange {
     finally { $view.Dispose() }
 }
 
+# ================================================================ 效果预览图
+# 把"现在的排列 / 严格分行 / 拼行填满"三种画法画成一张对比图，不动真实图标。
+
+function Get-ShIconBitmap([string]$path) {
+    if (-not (Test-DotNetType 'ShIconDump')) {
+        Add-Type -ReferencedAssemblies System.Drawing -TypeDefinition @'
+using System;
+using System.Drawing;
+using System.Runtime.InteropServices;
+public static class ShIconDump {
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    public struct SHFILEINFO {
+        public IntPtr hIcon; public int iIcon; public uint dwAttributes;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)] public string szDisplayName;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 80)] public string szTypeName;
+    }
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+    static extern IntPtr SHGetFileInfo(string pszPath, uint dwAttributes, ref SHFILEINFO psfi, uint cbFileInfo, uint uFlags);
+    [DllImport("user32.dll")] static extern bool DestroyIcon(IntPtr hIcon);
+    public static Bitmap Get(string p) {
+        if (string.IsNullOrEmpty(p)) return null;
+        SHFILEINFO f = new SHFILEINFO();
+        IntPtr r = SHGetFileInfo(p, 0, ref f, (uint)Marshal.SizeOf(typeof(SHFILEINFO)), 0x100);
+        if (r == IntPtr.Zero || f.hIcon == IntPtr.Zero) return null;
+        try { using (Icon ic = Icon.FromHandle(f.hIcon)) { return new Bitmap(ic.ToBitmap()); } }
+        finally { DestroyIcon(f.hIcon); }
+    }
+}
+'@
+    }
+    return [ShIconDump]::Get($path)
+}
+
+function New-DesktopPanel {
+    param([object]$Plan, [object]$Geo, [object]$Mon, [double]$Scale)
+    $w = $Mon.WRight - $Mon.WLeft
+    $h = $Mon.WBottom - $Mon.WTop
+    $pw = [int]($w * $Scale); $ph = [int]($h * $Scale)
+    $cellW = [single]($Geo.Cw * $Scale); $cellH = [single]($Geo.Ch * $Scale)
+    $bmp = New-Object -TypeName System.Drawing.Bitmap -ArgumentList $pw, $ph
+    $g = [System.Drawing.Graphics]::FromImage($bmp)
+    try {
+        $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+        $g.Clear([System.Drawing.Color]::FromArgb(252, 252, 254))
+
+        $gpen = New-Object -TypeName System.Drawing.Pen -ArgumentList ([System.Drawing.Color]::FromArgb(234, 237, 243)), 1
+        for ($c = 0; $c -lt $Geo.Cols; $c++) {
+            for ($r = 0; $r -lt $Geo.Rows; $r++) {
+                $x = [single]((Get-CellX $Geo $c) + $Geo.Ox - $Mon.WLeft) * $Scale
+                $y = [single]((Get-CellY $Geo $r) + $Geo.Oy - $Mon.WTop) * $Scale
+                $g.DrawRectangle($gpen, $x, $y, $cellW, $cellH)
+            }
+        }
+
+        $font = New-Object -TypeName System.Drawing.Font -ArgumentList 'Microsoft YaHei', 7
+        $brush = New-Object -TypeName System.Drawing.SolidBrush -ArgumentList ([System.Drawing.Color]::FromArgb(45, 45, 55))
+        $fmt = New-Object -TypeName System.Drawing.StringFormat
+        $fmt.Alignment = [System.Drawing.StringAlignment]::Center
+        $fmt.Trimming = [System.Drawing.StringTrimming]::EllipsisCharacter
+        $iconW = $cellW * 0.62
+        $iconH = $cellH * 0.50
+
+        foreach ($p in $Plan) {
+            $sx = $p.X + $Geo.Ox
+            $sy = $p.Y + $Geo.Oy
+            if ($sx -lt $Mon.WLeft -or $sx -ge $Mon.WRight) { continue }
+            $x = [single]($sx - $Mon.WLeft) * $Scale
+            $y = [single]($sy - $Mon.WTop) * $Scale
+            $ix = $x + ($cellW - $iconW) / 2
+            $ib = Get-ShIconBitmap (Resolve-IconPath $p.Name)
+            if ($ib) {
+                try { $g.DrawImage($ib, $ix, ($y + $cellH * 0.06), $iconW, $iconH) }
+                finally { $ib.Dispose() }
+            }
+            else {
+                $b2 = New-Object -TypeName System.Drawing.SolidBrush -ArgumentList ([System.Drawing.Color]::FromArgb(192, 197, 207))
+                $g.FillRectangle($b2, $ix, ($y + $cellH * 0.06), $iconW, $iconH)
+                $b2.Dispose()
+            }
+            $rect = New-Object -TypeName System.Drawing.RectangleF -ArgumentList ([single]($x - $cellW * 0.2)), ([single]($y + $cellH * 0.60)), ([single]($cellW * 1.4)), ([single]($cellH * 0.36))
+            $g.DrawString($p.Name, $font, $brush, $rect, $fmt)
+        }
+        $font.Dispose(); $brush.Dispose(); $fmt.Dispose(); $gpen.Dispose()
+    }
+    finally { $g.Dispose() }
+    return $bmp
+}
+
+function Invoke-Render {
+    param([int]$MonitorIndex = -1, [string]$OutPath = '')
+    Add-Type -AssemblyName System.Drawing
+    $mons = Get-MonitorList
+    $view = New-Object DesktopView
+    try {
+        $origin = Get-ListOrigin $view
+        $cw = $view.Spacing[0]; $ch = $view.Spacing[1]
+        $raw = @(Get-IconRows $view)
+        if ($raw.Count -eq 0) { Write-Host "桌面上没有图标，无法生成效果图。" -ForegroundColor DarkYellow; return }
+        Initialize-GridInfo $view $mons $raw $origin $cw $ch
+        $raw = @(Get-IconRows $view)
+
+        if ($MonitorIndex -lt 0 -or $MonitorIndex -ge $mons.Count) {
+            $cnt = Get-IconCounts $mons $raw $origin
+            $bestI = 0; $bestN = -1
+            foreach ($k in $cnt.Keys) { if ($cnt[$k] -gt $bestN) { $bestN = $cnt[$k]; $bestI = $k } }
+            $MonitorIndex = $bestI
+        }
+        $mon = @($mons | Where-Object { $_.Index -eq $MonitorIndex })[0]
+        $geo = Get-MonitorGeo $mon $cw $ch $origin.X $origin.Y
+
+        $now = @($raw | ForEach-Object { [pscustomobject]@{ Name = $_.Name; X = $_.X; Y = $_.Y } })
+        $panels = @()
+        $panels += @{ Title = 'A. 现在（你的桌面）'; Plan = $now }
+
+        $savedStrategy = $Strategy
+        foreach ($st in @('Strict', 'Packed')) {
+            $script:Strategy = $st
+            $b = Build-Plan $raw $geo $mons $view
+            $title = if ($st -eq 'Strict') { 'B. 严格分行：一行一个色系' } else { 'C. 拼行填满：行尾接下一个色系' }
+            $panels += @{ Title = $title; Plan = @($b.Plan) }
+            Write-Host ""
+            Write-Host ("[{0}] 应用区配色（自上而下）：" -f $st) -ForegroundColor Cyan
+            foreach ($row in $b.AppRows) {
+                Write-Host ("    第 {0} 行  {1}：{2}" -f ($row.Row + 1), $row.Family, (@($row.Names) -join '、')) -ForegroundColor DarkGray
+            }
+        }
+        $script:Strategy = $savedStrategy
+
+        $w = $mon.WRight - $mon.WLeft
+        $scale = [math]::Min(1.0, 1180.0 / $w)
+        $panelW = [int]($w * $scale)
+        $panelH = [int](($mon.WBottom - $mon.WTop) * $scale)
+        $gap = 16; $barH = 34
+        $totalW = $panelW * $panels.Count + $gap * ($panels.Count + 1)
+        $totalH = $barH + $panelH + $gap * 2
+        $canvas = New-Object -TypeName System.Drawing.Bitmap -ArgumentList $totalW, $totalH
+        $cg = [System.Drawing.Graphics]::FromImage($canvas)
+        try {
+            $cg.Clear([System.Drawing.Color]::FromArgb(236, 239, 245))
+            $tfont = New-Object -TypeName System.Drawing.Font -ArgumentList 'Microsoft YaHei', 12, ([System.Drawing.FontStyle]::Bold)
+            $tbrush = New-Object -TypeName System.Drawing.SolidBrush -ArgumentList ([System.Drawing.Color]::FromArgb(28, 30, 40))
+            $bpen = New-Object -TypeName System.Drawing.Pen -ArgumentList ([System.Drawing.Color]::FromArgb(198, 203, 214)), 1
+            $x = $gap
+            foreach ($pn in $panels) {
+                $cg.DrawString($pn.Title, $tfont, $tbrush, [single]$x, 8)
+                $pb = New-DesktopPanel $pn.Plan $geo $mon $scale
+                $cg.DrawImage($pb, $x, ($barH + $gap))
+                $cg.DrawRectangle($bpen, $x, ($barH + $gap), $panelW, $panelH)
+                $pb.Dispose()
+                $x += $panelW + $gap
+            }
+            $tfont.Dispose(); $tbrush.Dispose(); $bpen.Dispose()
+        }
+        finally { $cg.Dispose() }
+
+        if (-not $OutPath) { $OutPath = Join-Path $snapDir ("preview-m{0}.png" -f ($mon.Index + 1)) }
+        $canvas.Save($OutPath, [System.Drawing.Imaging.ImageFormat]::Png)
+        $canvas.Dispose()
+        Write-Host ""
+        Write-Host ("效果图已生成：{0}" -f $OutPath) -ForegroundColor Green
+    }
+    finally { $view.Dispose() }
+}
+
 function Invoke-SaveMine {
     $view = New-Object DesktopView
     try { $rows = @(Get-IconRows $view) } finally { $view.Dispose() }
@@ -1202,4 +1388,5 @@ switch ($Action) {
     'Apply'    { Invoke-Apply -NoConfirm:$Yes }
     'Undo'     { Invoke-Undo }
     'Original' { Invoke-Original }
+    'Render'   { Invoke-Render -MonitorIndex $Monitor -OutPath $Out }
 }
