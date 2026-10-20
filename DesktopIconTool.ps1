@@ -67,7 +67,8 @@ try { $script:shell = New-Object -ComObject WScript.Shell } catch { $script:shel
 # ------------------------------------------------------------------- 参数
 $folderCols = 2          # 文件夹区宽度（列数）
 $fileRowMax = 5          # 单个文件类型最宽占几列
-$appMinCols = 3          # 应用区最少占几列（防止高分辨率副屏上被压成又高又窄的两列）
+$appAspectTarget = 1.0 / 3.0   # 应用区整块的"宽:高"目标（1:3 的竖条）；列数按它自动求解
+$appBandWeight   = 0.60        # 挑列数时"一行一个色系"的权重（行数越接近色系数越好）
 # 颜色分类（v2：面积投票 + 中位色，规则移植自上一版 desktop-icon-arranger 工程）
 $whiteAreaCut = 0.50     # 近白像素占比达到此值 → 白色系
 $whiteMedCut  = 0.85     # 中位亮度达到此值 → 白色系
@@ -629,22 +630,60 @@ function Build-Plan {
         return $g
     }
 
-    # 应用区宽度：先按"塞满屏幕高度所需的最少列数"算，再保证不少于 $appMinCols 列。
-    # 行数多的屏（如副屏 14 行）上，最少列数会把 20 个图标压成 2 列 —— 又高又窄，
-    # 颜色带还被切成十几行。给个下限，让颜色带保持横向舒展；屏幕太窄时再退回最少列数。
-    $appColWidthNeeded = [math]::Max(1, [int][math]::Ceiling($appNames.Count / [math]::Max(1, $rows)))
-    $appColWidth = [math]::Max($appMinCols, $appColWidthNeeded)
+    # ---- 应用区列数：按屏幕和图标算出来，而不是写死 ----
+    # 对每个候选列数 w（从"塞满屏幕高度所需的最少列数"到"不会撞上文件夹区的最宽"）：
+    #   ① 用真正的分行算法试排一次，算出实际会占几行；超过屏幕行数的直接淘汰；
+    #   ② 观感分：整块的像素"宽:高"离目标（默认 1:3 的竖条）有多近；
+    #   ③ 色带分：行数离"色系个数"有多近（理想状态是一行一个色系，行数≈色系数）。
+    # 取总分最小的；同分时取更窄的（更紧凑，给桌面中间留白）。
+    $all = @($orderedNormal) + @($orderedBottom)
+    $appColWidthMin   = [math]::Max(1, [int][math]::Ceiling($appNames.Count / [math]::Max(1, $rows)))
     $appColWidthLimit = $cols - $folderZoneCol - $folderCols - 2   # 再宽就会撞上文件夹区
-    if ($appColWidthLimit -ge 1 -and $appColWidth -gt $appColWidthLimit) { $appColWidth = $appColWidthLimit }
+    if ($appColWidthLimit -lt $appColWidthMin) { $appColWidthLimit = $appColWidthMin }
+    $famCount = @($appInfo | ForEach-Object { $_.Family } | Select-Object -Unique).Count
+
+    # 先按"尽量不拆色系"分行；只有当屏幕高度实在放不下时，才退回"逐行填满"（允许拆色系）。
+    function Get-FitRowGroups([object[]]$Ordered, [int]$Width) {
+        $g = @(Get-CompactRowGroups $Ordered $Width)
+        if ($g.Count -le $rows) { return $g }
+        $p = @()
+        for ($i = 0; $i -lt $Ordered.Count; $i += $Width) {
+            $end = [math]::Min($i + $Width - 1, $Ordered.Count - 1)
+            $p += , @{ Family = 'PACKED'; Items = @($Ordered[$i..$end]) }
+        }
+        return $p
+    }
+
+    function Measure-AppWidth([int]$Width) {
+        $g = @(Get-FitRowGroups $all $Width)
+        if ($g.Count -eq 0 -or $g.Count -gt $rows) { return $null }
+        $aspect = ($Width * [double]$Geo.Cw) / ([double]($g.Count * $Geo.Ch))
+        $shape  = [math]::Abs([math]::Log($aspect / $appAspectTarget))
+        $band   = if ($famCount -gt 0) { [math]::Min(1.0, [math]::Abs($g.Count - $famCount) / [double]$famCount) } else { 0.0 }
+        [pscustomobject]@{ Width = $Width; Rows = $g.Count; Score = ($shape + $appBandWeight * $band) }
+    }
+
+    $bestWidth = $null
+    for ($w = $appColWidthMin; $w -le $appColWidthLimit; $w++) {
+        $s = Measure-AppWidth $w
+        if ($null -eq $s) { continue }
+        if ($null -eq $bestWidth -or $s.Score -lt ($bestWidth.Score - 0.0001)) { $bestWidth = $s }
+    }
+    if ($null -eq $bestWidth) {
+        # 候选宽度全部超行：继续加宽直到放得下（后面的防撞检查会兜底）
+        for ($w = $appColWidthLimit + 1; $w -lt $cols; $w++) {
+            $s = Measure-AppWidth $w
+            if ($null -ne $s) { $bestWidth = $s; break }
+        }
+    }
+    $appColWidth = if ($null -ne $bestWidth) { $bestWidth.Width } else { $appColWidthMin }
 
     if ($Strategy -eq 'Compact') {
-        # 紧凑拼行：行数已经是最少的；万一还是超过屏幕行数，就加宽一列再试。
-        $all = @($orderedNormal) + @($orderedBottom)
-        $groups = @()
-        while ($true) {
-            $groups = @(Get-CompactRowGroups $all $appColWidth)
-            if ($groups.Count -le $rows -or $appColWidth -ge $cols) { break }
+        # 紧凑拼行：按上面选出的列数分行；万一还是超行，就加宽一列再试。
+        $groups = @(Get-FitRowGroups $all $appColWidth)
+        while ($groups.Count -gt $rows -and $appColWidth -lt $cols) {
             $appColWidth++
+            $groups = @(Get-FitRowGroups $all $appColWidth)
         }
     }
     elseif ($Strategy -eq 'Packed') {
