@@ -67,6 +67,7 @@ try { $script:shell = New-Object -ComObject WScript.Shell } catch { $script:shel
 # ------------------------------------------------------------------- 参数
 $folderCols = 2          # 文件夹区宽度（列数）
 $fileRowMax = 5          # 单个文件类型最宽占几列
+$appMinCols = 3          # 应用区最少占几列（防止高分辨率副屏上被压成又高又窄的两列）
 # 颜色分类（v2：面积投票 + 中位色，规则移植自上一版 desktop-icon-arranger 工程）
 $whiteAreaCut = 0.50     # 近白像素占比达到此值 → 白色系
 $whiteMedCut  = 0.85     # 中位亮度达到此值 → 白色系
@@ -628,7 +629,14 @@ function Build-Plan {
         return $g
     }
 
-    $appColWidth = [math]::Max(1, [int][math]::Ceiling($appNames.Count / [math]::Max(1, $rows)))
+    # 应用区宽度：先按"塞满屏幕高度所需的最少列数"算，再保证不少于 $appMinCols 列。
+    # 行数多的屏（如副屏 14 行）上，最少列数会把 20 个图标压成 2 列 —— 又高又窄，
+    # 颜色带还被切成十几行。给个下限，让颜色带保持横向舒展；屏幕太窄时再退回最少列数。
+    $appColWidthNeeded = [math]::Max(1, [int][math]::Ceiling($appNames.Count / [math]::Max(1, $rows)))
+    $appColWidth = [math]::Max($appMinCols, $appColWidthNeeded)
+    $appColWidthLimit = $cols - $folderZoneCol - $folderCols - 2   # 再宽就会撞上文件夹区
+    if ($appColWidthLimit -ge 1 -and $appColWidth -gt $appColWidthLimit) { $appColWidth = $appColWidthLimit }
+
     if ($Strategy -eq 'Compact') {
         # 紧凑拼行：行数已经是最少的；万一还是超过屏幕行数，就加宽一列再试。
         $all = @($orderedNormal) + @($orderedBottom)
