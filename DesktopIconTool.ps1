@@ -806,44 +806,89 @@ function Build-Plan {
 }
 
 # ================================================================ 落地执行
+# 图标名 -> 下标列表。
+# 必须区分大小写：桌面上可以同时有 opencode 和 OpenCode（公共桌面 + 用户桌面各一个）。
+# PowerShell 的哈希表默认忽略大小写，会把这两个图标当成同一个 —— 于是方案里的两条
+# 指令都落到同一个下标上，另一个图标永远没人搬，修补多少轮都"排不到位"。
 function Get-IndexMap([object]$v, [int]$n) {
-    $m = @{}
-    for ($i = 0; $i -lt $n; $i++) { $m[$v.GetName($i)] = $i }
+    $m = New-Object 'System.Collections.Hashtable' ([System.StringComparer]::Ordinal)
+    for ($i = 0; $i -lt $n; $i++) {
+        $nm = [string]$v.GetName($i)
+        if (-not $m.ContainsKey($nm)) { $m[$nm] = New-Object System.Collections.ArrayList }
+        [void]$m[$nm].Add($i)
+    }
     return $m
 }
 
-function Get-OffTarget([object]$v, [object]$m, [object]$pl) {
+# 把方案里的每一条解析成一个唯一的图标下标；完全同名的图标按出现顺序一一分配。
+function Resolve-PlanIndexes([object]$map, [object[]]$Plan) {
+    $n = @($Plan).Count
+    $idx = New-Object 'int[]' $n
+    $cursor = New-Object 'System.Collections.Hashtable' ([System.StringComparer]::Ordinal)
+    for ($i = 0; $i -lt $n; $i++) {
+        $nm = [string]$Plan[$i].Name
+        $list = $map[$nm]
+        $k = 0
+        if ($cursor.ContainsKey($nm)) { $k = [int]$cursor[$nm] }
+        if ($null -ne $list -and $k -lt $list.Count) { $idx[$i] = [int]$list[$k] } else { $idx[$i] = -1 }
+        $cursor[$nm] = $k + 1
+    }
+    return $idx
+}
+
+function Get-OffTarget([object]$View, [object[]]$Plan, [int[]]$Idx) {
     $bad = @()
-    foreach ($p in $pl) {
-        if (-not $m.ContainsKey($p.Name)) { continue }
-        $pos = $v.GetPosition($m[$p.Name])
-        if ($pos[0] -ne $p.X -or $pos[1] -ne $p.Y) { $bad += $p }
+    for ($i = 0; $i -lt @($Plan).Count; $i++) {
+        if ($Idx[$i] -lt 0) { continue }
+        $pos = $View.GetPosition($Idx[$i])
+        if ($pos[0] -ne $Plan[$i].X -or $pos[1] -ne $Plan[$i].Y) { $bad += $Plan[$i] }
     }
     return $bad
 }
 
-# 三阶段落地：先停到临时空列，再逐一就位，最后修补。
+# 三阶段落地：先停到临时空位，再逐一就位，最后修补。
 # （移动到已被占用的格子会把原主挤开，所以必须先全部腾空。）
 function Invoke-PlacePlan {
     param([object]$View, [object[]]$Plan, [object[]]$StageCells)
 
     $count = $View.Count
-    if ($count -ne $Plan.Count) { throw "桌面图标数量在排列过程中发生了变化（$count vs $($Plan.Count)），已放弃。" }
+    if ($count -ne @($Plan).Count) { throw "桌面图标数量在排列过程中发生了变化（$count vs $(@($Plan).Count)），已放弃。" }
 
+    # 先把方案解析成"每个条目的唯一图标下标"，之后全程只认下标，不再按名字找图标
     $map = Get-IndexMap $View $count
+    $idx = Resolve-PlanIndexes $map @($Plan)
+    $lost = @()
+    $slot = @{}
+    for ($i = 0; $i -lt @($Plan).Count; $i++) {
+        $prop = $Plan[$i].PSObject.Properties['Index']
+        if ($null -ne $prop) { $idx[$i] = [int]$prop.Value }
+        if ($idx[$i] -lt 0 -or $idx[$i] -ge $count) { $lost += $Plan[$i].Name; continue }
+        if ($slot.ContainsKey($idx[$i])) { $lost += $Plan[$i].Name; continue }
+        $slot[$idx[$i]] = $i
+    }
+    if ($lost.Count) { throw ("这些图标在桌面上找不到了：{0}" -f (($lost | Select-Object -Unique) -join '、')) }
+
+    # 方案里两个条目指向同一格，会互相挤，先报错而不是排完再修
+    $seenCell = @{}
+    for ($i = 0; $i -lt @($Plan).Count; $i++) {
+        $k = '{0},{1}' -f $Plan[$i].X, $Plan[$i].Y
+        if ($seenCell.ContainsKey($k)) {
+            throw ("排列方案里有重复的目标格 {0}：{1} 和 {2}" -f $k, $seenCell[$k], $Plan[$i].Name)
+        }
+        $seenCell[$k] = $Plan[$i].Name
+    }
 
     # 阶段 1：先全部停到临时空位
-    for ($i = 0; $i -lt $Plan.Count; $i++) {
+    for ($i = 0; $i -lt @($Plan).Count; $i++) {
         $c = $StageCells[$i]
-        $View.SetPosition($map[$Plan[$i].Name], $c.X, $c.Y)
+        $View.SetPosition($idx[$i], $c.X, $c.Y)
         Start-Sleep -Milliseconds 20
     }
     Start-Sleep -Milliseconds 500
 
     # 阶段 2：逐一就位
-    $map = Get-IndexMap $View $count
-    foreach ($p in $Plan) {
-        $View.SetPosition($map[$p.Name], $p.X, $p.Y)
+    for ($i = 0; $i -lt @($Plan).Count; $i++) {
+        $View.SetPosition($idx[$i], $Plan[$i].X, $Plan[$i].Y)
         Start-Sleep -Milliseconds 20
     }
     $View.Refresh()
@@ -857,16 +902,17 @@ function Invoke-PlacePlan {
     $halfH = [int][math]::Max(2, [math]::Floor($ch / 2))
     $adopted = @{}
     for ($pass = 1; $pass -le 12; $pass++) {
-        $map = Get-IndexMap $View $count
-        $bad = @()
-        foreach ($p in $Plan) {
-            $pos = $View.GetPosition($map[$p.Name])
-            if ($pos[0] -ne $p.X -or $pos[1] -ne $p.Y) { $bad += , @($p, $pos) }
+        $bad = New-Object System.Collections.ArrayList
+        for ($i = 0; $i -lt @($Plan).Count; $i++) {
+            $pos = $View.GetPosition($idx[$i])
+            if ($pos[0] -ne $Plan[$i].X -or $pos[1] -ne $Plan[$i].Y) {
+                [void]$bad.Add([pscustomobject]@{ I = $i; Pos = $pos })
+            }
         }
         if ($bad.Count -eq 0) { break }
         Write-Host ("  修补第 {0} 轮：还有 {1} 个图标没到位" -f $pass, $bad.Count) -ForegroundColor DarkYellow
         foreach ($item in $bad) {
-            $p = $item[0]; $pos = $item[1]
+            $i = [int]$item.I; $pos = $item.Pos; $p = $Plan[$i]
             $dx = [int]($pos[0] - $p.X); $dy = [int]($pos[1] - $p.Y)
             $key = "$($pos[0]),$($pos[1])"
             if ([math]::Abs($dx) -le $halfW -and [math]::Abs($dy) -le $halfH -and -not $adopted.ContainsKey($key)) {
@@ -874,7 +920,7 @@ function Invoke-PlacePlan {
                 $p.X = [int]$pos[0]; $p.Y = [int]$pos[1]
             }
             else {
-                $View.SetPosition($map[$p.Name], $p.X, $p.Y)
+                $View.SetPosition($idx[$i], $p.X, $p.Y)
                 Start-Sleep -Milliseconds 20
             }
         }
@@ -882,24 +928,39 @@ function Invoke-PlacePlan {
         Start-Sleep -Milliseconds 600
     }
 
-    $map = Get-IndexMap $View $count
-    return @(Get-OffTarget $View $map $Plan)
+    return @(Get-OffTarget $View @($Plan) $idx)
 }
 
-# 为方案准备"临时停车位"：所选屏幕里没被方案占用的列
-function Get-StageCells([object]$Plan, [object]$Geo) {
-    $planCols = @($Plan | ForEach-Object { [int][math]::Round(($_.X - $Geo.AnchorX) / $Geo.Cw) } | Sort-Object -Unique)
-    $freeCols = @()
-    for ($k = $Geo.KMin; $k -le $Geo.KMax; $k++) { if ($planCols -notcontains $k) { $freeCols += $k } }
-    $needCols = [int][math]::Ceiling($Plan.Count / [math]::Max(1, $Geo.Rows))
-    if ($freeCols.Count -lt $needCols) { throw "没有足够的临时空位来安全地搬运图标（需要 $needCols 列，只有 $($freeCols.Count) 列）。" }
-    $cells = @()
-    for ($i = 0; $i -lt $Plan.Count; $i++) {
-        $col = $freeCols[[int][math]::Floor($i / $Geo.Rows)]
-        $row = $Geo.JMin + ($i % $Geo.Rows)
-        $cells += [pscustomobject]@{ X = [int]($Geo.AnchorX + $col * $Geo.Cw); Y = [int]($Geo.AnchorY + $row * $Geo.Ch) }
+# 为方案准备"临时停车位"：优先选当前根本没有图标、也不是任何目标格的格子。
+# 这样搬进去不会把别的图标挤开 —— 被挤开的图标会连锁错位，最后表现为"有几个总是排不好"。
+function Get-StageCells([object]$Plan, [object]$Geo, [object]$View) {
+    $targets = @{}
+    foreach ($p in $Plan) { $targets['{0},{1}' -f $p.X, $p.Y] = $true }
+    $occupied = @{}
+    if ($null -ne $View) {
+        for ($i = 0; $i -lt $View.Count; $i++) {
+            $pos = $View.GetPosition($i)
+            $occupied['{0},{1}' -f $pos[0], $pos[1]] = $true
+        }
     }
-    return $cells
+    $idle = @(); $spare = @()
+    for ($r = $Geo.JMin; $r -le $Geo.JMax; $r++) {
+        for ($k = $Geo.KMin; $k -le $Geo.KMax; $k++) {
+            $x = [int]($Geo.AnchorX + $k * $Geo.Cw)
+            $y = [int]($Geo.AnchorY + $r * $Geo.Ch)
+            $key = '{0},{1}' -f $x, $y
+            if ($targets.ContainsKey($key)) { continue }
+            $cell = [pscustomobject]@{ X = $x; Y = $y }
+            $spare += $cell
+            if (-not $occupied.ContainsKey($key)) { $idle += $cell }
+        }
+    }
+    $need = @($Plan).Count
+    $cells = if ($idle.Count -ge $need) { $idle } else { $spare }
+    if ($cells.Count -lt $need) {
+        throw ("没有足够的临时空位来安全地搬运图标（需要 {0} 个，只有 {1} 个）。" -f $need, $cells.Count)
+    }
+    return @($cells[0..($need - 1)])
 }
 
 # ================================================================ 恢复布局
@@ -920,7 +981,9 @@ function Find-NearestFreeCell([object]$cells, [object]$used, [int]$x, [int]$y) {
 function Build-RestorePlan {
     param([object]$View, [object[]]$Layout, [object[]]$Monitors, [object]$Origin, [int]$Cw, [int]$Ch)
 
-    $map = Get-IndexMap $View $View.Count
+    $count = $View.Count
+    $nameOf = @()
+    for ($i = 0; $i -lt $count; $i++) { $nameOf += [string]$View.GetName($i) }
     $snapOn = if ($null -ne $script:GridInfo) { [bool]$script:GridInfo.Snap } else { $true }
 
     # 当前每块屏幕上的合法格子（同一块屏幕内按列优先排序，便于就近吸附）
@@ -944,11 +1007,18 @@ function Build-RestorePlan {
     # 而不会因为像素对不上就把整屏图标全部重排。
     $plan = New-Object System.Collections.ArrayList
     $used = @{}
-    $placedNames = @{}
+    $taken = @{}
     $missing = 0
     $snapped = 0
     foreach ($e in $Layout) {
-        if (-not $map.ContainsKey($e.Name)) { $missing++; continue }
+        # 按"完全同名"找一个还没分配的图标下标：
+        # 公共桌面和用户桌面可能有仅大小写不同的同名图标，必须逐个消耗，不能按名字归并。
+        $idx = -1
+        for ($i = 0; $i -lt $count; $i++) {
+            if ($taken.ContainsKey($i)) { continue }
+            if ([string]::Equals($nameOf[$i], [string]$e.Name, [System.StringComparison]::Ordinal)) { $idx = $i; break }
+        }
+        if ($idx -lt 0) { $missing++; continue }
         $vx = [int]$e.X + $Origin.X
         $vy = [int]$e.Y + $Origin.Y
         $monIdx = Get-MonitorOfPoint $Monitors $vx $vy
@@ -964,14 +1034,14 @@ function Build-RestorePlan {
         if ($null -eq $pick) { continue }
 
         $used["$($pick.X),$($pick.Y)"] = $true
-        $placedNames[$e.Name] = $true
+        $taken[$idx] = $true
         if ($pick.X -ne [int]$e.X -or $pick.Y -ne [int]$e.Y) { $snapped++ }
-        [void]$plan.Add([pscustomobject]@{ Name = $e.Name; X = $pick.X; Y = $pick.Y })
+        [void]$plan.Add([pscustomobject]@{ Name = $e.Name; Index = $idx; X = $pick.X; Y = $pick.Y })
     }
 
-    # 快照里没有的新图标，塞进剩下的空格子
+    # 快照里没有的新图标，塞进剩下的空格子（按下标挑，重名也不会漏）
     $extra = @()
-    foreach ($n in $map.Keys) { if (-not $placedNames.ContainsKey($n)) { $extra += $n } }
+    for ($i = 0; $i -lt $count; $i++) { if (-not $taken.ContainsKey($i)) { $extra += $i } }
     $free = @($allCells | Where-Object { -not $used.ContainsKey("$($_.X),$($_.Y)") })
     $leftover = 0
     $placedExtras = 0
@@ -979,7 +1049,7 @@ function Build-RestorePlan {
         if ($i -ge $free.Count) { $leftover++; continue }
         $p = $free[$i]
         $used["$($p.X),$($p.Y)"] = $true
-        [void]$plan.Add([pscustomobject]@{ Name = $extra[$i]; X = $p.X; Y = $p.Y })
+        [void]$plan.Add([pscustomobject]@{ Name = $nameOf[$extra[$i]]; Index = $extra[$i]; X = $p.X; Y = $p.Y })
         $placedExtras++
     }
 
@@ -1151,7 +1221,7 @@ function Invoke-Arrange {
         Push-History $raw
         Write-Host ("已备份 {0} 个图标的当前位置。" -f $raw.Count) -ForegroundColor DarkGray
 
-        $stage = Get-StageCells $built.Plan $geo
+        $stage = Get-StageCells $built.Plan $geo $view
         $bad = Invoke-PlacePlan -View $view -Plan $built.Plan -StageCells $stage
         Write-Host ""
         if ($bad.Count -eq 0) {
